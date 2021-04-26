@@ -1,0 +1,75 @@
+= Appcues Platform Engineer Project
+
+== Understanding the Problem
+
+At first glance, the problem looks simple: the state of the counter is the sum of all _increment_ commands sent to the server. One important aspect of it is that the persisted state is eventually consistent with a hard constraint, i.e., we should keep it _at most_ ten seconds behind the state in memory. As a non-functional requirement, the final solution should be scalable and sound.
+
+A couple of other requirements can be derived from this. First, we need to ensure consistency between flushes, i.e., assert that no commands are lost during a flush operation. Then, in order to increase scalability of the system, multiple instances should be able to concurrently increment the persisted counter atomically. All while consuming the commands via an HTTP endpoint.
+
+Finally, it's outside of the scope of this task to ensure consensus and linearizability, either within the same instance or between instances.
+
+== Proposed Solution
+
+By looking at the problem, it's possible to infer that the problem can be reduced to basic arithmethics, i.e., the commands are either an addition (when `value` is positive) or subtraction (when `value` is negative). The persisted state will be, in the end of the day, the sum of all commands sent to the available instances. This is only possible because we're ignoring linearizability, which allows us to rely on the _commutative_ property of addition.
+
+The solution is designed as follows:
+
+1. Every instance will keep its own state in memory, effectively acting as a buffer of `key`/`value` pairs;
+2. The `value` in memory is always the result of the command applications between flushes, after which it will be reset to zero and collect new commands;
+3. There's a background task (`Flusher`) responsible for collecting the buffer, storing it and clearing it.
+4. The flushing process is done by leveraging PostgreSQL's UPSERT semantics to avoid read-update-store cycles with `SERIALIZABLE` transactions.
+
+== Challenges & Lessons Learned
+
+When analyzing the problem thoroughly, the first solution was apparently a good one: use a concurrent map to store the commands until a flush happens. After a few iterations, it was clear that we didn't even need to store events at all, as the only requirement is that the final snapshot is eventually consistent.
+
+After the draft greenfield solution was written, it was time to polish it up and add tests that would ensure its stability. Then we faced the first big challenge: testing concurrent code is hard. It's even harder when concurrency is impredictable, like in this case.
+
+To ensure the stability of the solution, we chose to use probabilistic testing, i.e., force an unreasonable amount of concurrent changes in the integration test to push the system to its boundaries. Writing these tests was a big challenge because of all the parts involved -- in memory map, runtime task scheduler and the database.
+
+With more time we should probably spend some time on reviewing the test cases. Currently, they cover the most important units (updating the in-memory cache and persisting some data in the database) and the integration between the flushing process and the database.
+
+Finally, this is not Production ready. It's still unclear how the data will be read, and what are the specific requirements regarding consistency and linearizability. Theoretically, it's impossible to prove, with the current implementation, that the value stored in the persistency layer will ever be real-time consistent, or even that it does indeed represent a snapshot in time. This can be demonstrated with a counter example on a linear sequence of events:
+
+1. A receives (increment +1);
+2. B receives (decrement -1);
+3. A receives (increment +1);
+4. A flushes its buffer;
+5. B receives (decrement -1);
+6. B flushes its buffer;
+7. Loop.
+
+The value stored in point 4. will be `2`, which was never observed in the actual timeline of the counter. A possible production implementation could rely on some consensus protocol to keep state consistent between instances (Raft, Paxos etc.), or use vector clocks to store events with a deterministic flush interval.
+
+== Running the Project
+
+=== Set up the Environment
+
+The project is written in Rust and have no dependencies other than Rust libraries. To set it up, install the Rust toolchain using link:http://rustup.rs[rustup]:
+
+    $ rustup default stable
+
+=== Running Tests and Benchmarks
+
+First you need a Postgres instance listening on the port `5433`. For convenience, a Docker compose file is provided:
+
+    $ docker compose -f docker-compose-test.yml up -d
+    $ cargo test
+
+To run the benchmarks, the same Postgres port is used. With the Postgres server up, run:
+
+    $ cargo bench
+
+=== Simulating a Production Environment
+
+For convenince, a Docker compose file is provided to help start an environment with a database (Postgres), a load balancer (nginx) and multiple instances of the application. To spin up this environment, run the following command:
+
+    $ docker compose up --scale appcues=<number of instances>
+
+Once `nginx` is up, it will be listening in port `3333`.
+
+If, on the other hand, you want to start the application in port `3333`, ensure that you have a Postgres instance available, update `settings.toml` with the correct `database_url` and then run:
+
+    $ cargo run --release
+
+This will start a single instance of the application.
